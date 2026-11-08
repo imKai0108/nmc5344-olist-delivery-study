@@ -1,0 +1,346 @@
+---
+title: "NMC5344 Final Project:E-Commerce Logistics and Customer Satisfaction"
+author: |
+  Chen Changru(A0356194W)  
+  Nguyen Thanh Thao(A0356426Y)  
+  Wu Kaibing(A0352523L)  
+  ZANETA WIDJAJA(A0356058X)  
+  RADHAKRISHNA SAATVIKA(A0352119J)  
+output:
+  pdf_document:
+    latex_engine: xelatex
+  html_document: default
+fontsize: 11pt
+geometry: margin=0.85in
+header-includes:
+  - \usepackage{float}
+  - \usepackage{booktabs}
+  - \usepackage{graphicx}
+  - \DefineVerbatimEnvironment{Highlighting}{Verbatim}{commandchars=\\\{\},fontsize=\small}
+  - \floatplacement{figure}{H}
+  - \floatplacement{table}{H}
+---
+
+```{r setup, include=TRUE}
+library(dplyr)
+library(ggplot2)
+library(knitr)
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center", fig.pos = "H", dpi = 180,
+                      out.width = "\\linewidth")
+```
+
+```{r read-data, include=TRUE}
+data_dir <- "data/olist"
+orders <- read.csv(file.path(data_dir, "olist_orders_dataset.csv"))
+order_items <- read.csv(file.path(data_dir, "olist_order_items_dataset.csv"))
+reviews <- read.csv(file.path(data_dir, "olist_order_reviews_dataset.csv"))
+products <- read.csv(file.path(data_dir, "olist_products_dataset.csv"))
+products$product_category_name[products$product_category_name == ""] <- NA
+customers <- read.csv(file.path(data_dir, "olist_customers_dataset.csv"))
+sellers <- read.csv(file.path(data_dir, "olist_sellers_dataset.csv"))
+payments <- read.csv(file.path(data_dir, "olist_order_payments_dataset.csv"))
+geolocation <- read.csv(file.path(data_dir, "olist_geolocation_dataset.csv"))
+category_translation <- read.csv(
+  file.path(data_dir, "product_category_name_translation.csv"),
+                                 fileEncoding = "UTF-8-BOM")
+
+dataset_overview <- data.frame(
+  Dataset = c("Orders", "Order items", "Reviews", "Products", "Customers",
+              "Sellers", "Payments", "Geolocation", "Category translation"),
+  Observations = c(nrow(orders), nrow(order_items), nrow(reviews), nrow(products),
+                   nrow(customers), nrow(sellers), nrow(payments),
+                   nrow(geolocation), nrow(category_translation)),
+  Variables = c(ncol(orders), ncol(order_items), ncol(reviews), ncol(products),
+                ncol(customers), ncol(sellers), ncol(payments),
+                ncol(geolocation), ncol(category_translation))
+)
+```
+
+```{r clean-data, include=TRUE}
+# Keep one review per order, using the same rule throughout.
+reviews_clean <- arrange(reviews, order_id, desc(review_creation_date),
+                          desc(review_answer_timestamp), desc(review_id))
+reviews_clean <- distinct(reviews_clean, order_id, .keep_all = TRUE)
+reviews_clean <- select(reviews_clean, order_id, review_score,
+                         review_creation_date, review_answer_timestamp)
+
+items_clean <- left_join(order_items,
+  select(products, product_id, product_category_name), by = "product_id")
+items_clean <- left_join(items_clean, category_translation,
+                        by = "product_category_name")
+items_clean$category <- coalesce(items_clean$product_category_name_english,
+                                 items_clean$product_category_name)
+
+# Sum item amounts before joining to orders.
+items_grouped <- group_by(items_clean, order_id)
+items_summary <- summarise(items_grouped,
+  freight_total = sum(freight_value),
+  order_value = sum(price),
+  product_category = case_when(
+    all(is.na(category)) ~ "Unknown",
+    any(is.na(category)) ~ "Mixed / unknown",
+    n_distinct(category) > 1 ~ "Mixed",
+    TRUE ~ first(category)),
+  .groups = "drop")
+
+analysis_data <- left_join(orders, reviews_clean, by = "order_id")
+analysis_data <- left_join(analysis_data, items_summary, by = "order_id")
+analysis_data$purchase_date <- as.Date(
+  substr(analysis_data$order_purchase_timestamp, 1, 10))
+analysis_data$actual_date <- as.Date(
+  substr(analysis_data$order_delivered_customer_date, 1, 10))
+analysis_data$estimated_date <- as.Date(
+  substr(analysis_data$order_estimated_delivery_date, 1, 10))
+analysis_data <- filter(analysis_data, order_status == "delivered",
+  !is.na(purchase_date), !is.na(actual_date), !is.na(estimated_date),
+  review_score %in% 1:5, !is.na(freight_total), freight_total >= 0,
+  !is.na(order_value), !is.na(product_category))
+
+analysis_data$delay_days <- as.numeric(
+  analysis_data$actual_date - analysis_data$estimated_date)
+analysis_data$late_days <- pmax(analysis_data$delay_days, 0)
+analysis_data$delivery_duration <- as.numeric(
+  analysis_data$actual_date - analysis_data$purchase_date)
+analysis_data$delivery_status <- ifelse(
+  analysis_data$delay_days > 0, "Late", "On-time/Early")
+stopifnot(!anyDuplicated(analysis_data$order_id))
+
+variable_info <- data.frame(
+  Variable = c("order_id", "review_score", "late_days", "delivery_duration",
+               "freight_total", "order_value", "product_category", "delivery_status"),
+  Type = c("Identifier", "Ordinal, stored numeric", "Numeric", "Numeric",
+           "Numeric", "Numeric", "Categorical", "Categorical"),
+  Definition = c("Unique order", "Rating from 1 to 5", "Days past estimated date",
+    "Purchase-to-delivery days", "Order freight, BRL",
+    "Item prices, excluding freight, BRL",
+    "Single, Mixed or unknown category", "Late versus on-time/early")
+)
+
+numeric_vars <- c("review_score", "late_days", "delivery_duration",
+                  "freight_total", "order_value")
+overall_stats <- data.frame()
+for (v in numeric_vars) {
+  x <- analysis_data[[v]]
+  row <- data.frame(Variable = v, N = length(x), Mean = mean(x),
+    Median = median(x), SD = sd(x), Min = min(x), Max = max(x))
+  overall_stats <- rbind(overall_stats, row)
+}
+
+group_stats <- data.frame()
+for (s in c("On-time/Early", "Late")) {
+  group_data <- filter(analysis_data, delivery_status == s)
+  for (v in numeric_vars) {
+    x <- group_data[[v]]
+    row <- data.frame(Status = s, Variable = v, N = length(x), Mean = mean(x),
+      Median = median(x), SD = sd(x), Min = min(x), Max = max(x))
+    group_stats <- rbind(group_stats, row)
+  }
+}
+late_orders <- filter(analysis_data, delivery_status == "Late")
+ontime_orders <- filter(analysis_data, delivery_status == "On-time/Early")
+```
+
+```{r prepare-models, include=TRUE}
+# Use the same complete sample and split for both models.
+model_data <- filter(analysis_data,
+  !product_category %in% c("Unknown", "Mixed / unknown"))
+model_data <- arrange(model_data, order_id)
+model_data$product_category <- factor(model_data$product_category)
+model_data$product_category <- relevel(
+  model_data$product_category, ref = "bed_bath_table")
+set.seed(5344)
+train_rows <- sample(seq_len(nrow(model_data)), floor(0.8 * nrow(model_data)))
+train <- model_data[train_rows, ]
+test <- model_data[-train_rows, ]
+
+model1 <- lm(review_score ~ late_days, data = train)
+model2 <- lm(review_score ~ late_days + freight_total + order_value + product_category,
+             data = train)
+ci1 <- confint(model1, "late_days")
+ci2 <- confint(model2, "late_days")
+b1 <- coef(model1)["late_days"]
+b2 <- coef(model2)["late_days"]
+adj1 <- summary(model1)$adj.r.squared
+adj2 <- summary(model2)$adj.r.squared
+
+model_comparison <- data.frame(
+  Measure = c("Training orders", "Test orders (reserved)", "Lateness coefficient",
+              "95% confidence interval", "Adjusted R-squared (training)"),
+  Model_1 = c(format(nrow(train), big.mark = ","), format(nrow(test), big.mark = ","),
+              sprintf("%.4f", b1), sprintf("[%.4f, %.4f]", ci1[1], ci1[2]),
+              sprintf("%.4f", adj1)),
+  Model_2 = c(format(nrow(train), big.mark = ","), format(nrow(test), big.mark = ","),
+              sprintf("%.4f", b2), sprintf("[%.4f, %.4f]", ci2[1], ci2[2]),
+              sprintf("%.4f", adj2))
+)
+```
+
+# 1. Introduction
+
+Delivery is a central part of the online shopping experience. Customers evaluate an order after paying for the product and waiting for its arrival, making review scores a useful measure of their experience. This project examines whether delivery delays are associated with lower customer ratings in the Olist Brazilian e-commerce dataset. Freight charges and product categories provide additional context for understanding rating differences. Four visualisations describe the main patterns, and two regression models assess the relationship between lateness and review scores before and after adjusting for order characteristics.
+
+# 2. Dataset and Data Preparation
+
+Olist records anonymised transactions from Brazilian marketplaces during 2016-2018. Table 1 reports the observations and variables in all nine source files. The analysis joins orders, reviews, order items, products and category translations. These five files connect delivery dates, customer ratings, item prices, shipping charges and product categories through order and product identifiers. The analytical unit is one order.
+
+```{r dataset-table, results='asis'}
+kable(dataset_overview, booktabs = TRUE, format = "latex",
+      caption = "Original Olist datasets", format.args = list(big.mark = ","))
+```
+
+Reviews are sorted by creation date, answer timestamp and review ID in descending order within each order, retaining the latest record. Item prices and freight charges are summed before joining to produce order totals. English category translations are used where available, with Portuguese names retained otherwise. Orders containing several known categories are labelled Mixed; missing categories receive explicit labels.
+
+Cleaning retains `r format(nrow(analysis_data), big.mark=',')` delivered orders from `r format(nrow(orders), big.mark=',')` original orders, with valid dates, review scores and monetary information. The analytical table contains `r ncol(analysis_data)` variables. Delay is the actual delivery date minus the estimated date in calendar days. The model variable late_days sets early and on-time deliveries to zero. Delivery duration measures days from purchase to arrival. Review scores are ordinal values from one to five, stored numerically; monetary variables are measured in Brazilian reais. Table 2 summarises the variables used.
+
+Delivery and freight comparisons use the full cleaned sample. Regression uses `r format(nrow(model_data), big.mark=',')` orders with known categories, including Mixed orders. The category visualisation selects the ten largest known single-category groups. These sample definitions align each analysis with its required variables.
+
+```{r variable-table, results='asis'}
+kable(variable_info, booktabs = TRUE, format = "latex",
+      caption = "Variables used in the analysis")
+```
+
+# 3. Descriptive Statistics
+
+Tables 3-5 report sample size, mean, median, standard deviation, minimum and maximum for the full sample and both delivery groups. The mean review score is `r sprintf('%.2f', mean(analysis_data$review_score))`, and the median is `r median(analysis_data$review_score)`. Delivery takes `r sprintf('%.2f', mean(analysis_data$delivery_duration))` days on average, with a median of `r median(analysis_data$delivery_duration)` days. Mean freight is BRL `r sprintf('%.2f', mean(analysis_data$freight_total))`, and mean item value is BRL `r sprintf('%.2f', mean(analysis_data$order_value))`. Both monetary distributions have high maximums and means above their medians. Late orders represent `r sprintf('%.2f', 100*nrow(late_orders)/nrow(analysis_data))`% of the sample. Their mean rating is `r sprintf('%.2f', mean(late_orders$review_score))`, compared with `r sprintf('%.2f', mean(ontime_orders$review_score))` for on-time or early orders: a difference of `r sprintf('%.2f', mean(ontime_orders$review_score)-mean(late_orders$review_score))` points.
+
+```{r overall-table, results='asis'}
+kable(overall_stats, digits = 2, booktabs = TRUE, format = "latex",
+      caption = "Overall descriptive statistics", format.args = list(big.mark = ","))
+```
+
+```{r ontime-table, results='asis'}
+ontime_stats <- filter(group_stats, Status == "On-time/Early")
+ontime_stats <- select(ontime_stats, -Status)
+kable(ontime_stats, digits = 2, booktabs = TRUE, format = "latex",
+      caption = "Descriptive statistics: on-time or early orders",
+      format.args = list(big.mark = ","))
+```
+
+```{r late-table, results='asis'}
+late_stats <- filter(group_stats, Status == "Late")
+late_stats <- select(late_stats, -Status)
+kable(late_stats, digits = 2, booktabs = TRUE, format = "latex",
+      caption = "Descriptive statistics: late orders", format.args = list(big.mark = ","))
+```
+
+# 4. Exploratory Visualisations
+
+```{r figure1, fig.width=7, fig.height=3.7, fig.cap='Average review score by delivery-delay category; labels show order counts.'}
+delay_data <- analysis_data
+delay_data$delay_category <- cut(delay_data$delay_days,
+  breaks = c(-Inf, 0, 3, 7, Inf),
+  labels = c("On-time/Early", "1-3 days late", "4-7 days late", "More than 7 days late"))
+delay_grouped <- group_by(delay_data, delay_category)
+delay_summary <- summarise(delay_grouped, average_review = mean(review_score),
+                           n = n(), .groups = "drop")
+ggplot(delay_summary, aes(x = delay_category, y = average_review)) +
+  geom_col(fill = "#3478B8", width = 0.65) +
+  geom_text(aes(label = sprintf("%.2f\n(n=%s)", average_review, n)),
+            vjust = -0.35, size = 3.3) +
+  scale_y_continuous(limits = c(0, 5.2), breaks = 0:5) +
+  labs(x = "Delivery delay category", y = "Average review score (1-5)") +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 12, hjust = 1))
+```
+
+Figure 1 shows that longer delays correspond to lower average ratings. On-time or early orders score `r sprintf('%.2f', delay_summary$average_review[1])`, falling to `r sprintf('%.2f', delay_summary$average_review[2])` for delays of one to three days and `r sprintf('%.2f', delay_summary$average_review[3])` for four to seven days. Orders arriving more than seven days late average `r sprintf('%.2f', delay_summary$average_review[4])`. Even the shortest delay group scores substantially below the on-time group.
+
+```{r figure2, fig.width=7, fig.height=3.6, fig.cap='Within-group rating percentages for on-time/early and late orders.'}
+score_distribution <- count(analysis_data, delivery_status, review_score)
+score_grouped <- group_by(score_distribution, delivery_status)
+score_distribution <- mutate(score_grouped, percentage = 100 * n / sum(n))
+score_distribution <- ungroup(score_distribution)
+score_distribution$rating <- factor(score_distribution$review_score, levels = 1:5)
+score_distribution$delivery_status <- factor(score_distribution$delivery_status,
+  levels = c("On-time/Early", "Late"))
+ggplot(score_distribution, aes(x = delivery_status, y = percentage, fill = rating)) +
+  geom_col(width = 0.6, position = position_stack(reverse = TRUE)) +
+  scale_fill_manual(values = c("#C0392B", "#E67E22", "#F4D03F", "#82B366", "#2874A6")) +
+  scale_y_continuous(limits = c(0, 100), breaks = seq(0, 100, 20)) +
+  labs(x = "Delivery status", y = "Percentage of reviews", fill = "Score") +
+  theme_minimal(base_size = 11)
+one_late <- filter(score_distribution,
+  delivery_status == "Late", review_score == 1)$percentage
+one_ontime <- filter(score_distribution,
+  delivery_status == "On-time/Early", review_score == 1)$percentage
+```
+
+Figure 2 shows a clear shift towards dissatisfaction among late orders. One-star reviews account for `r sprintf('%.2f', one_late)`% of late orders, compared with `r sprintf('%.2f', one_ontime)`% of on-time or early orders. A majority of late orders therefore receive the lowest rating. Percentages are calculated within each delivery group, giving both groups the same comparison scale.
+
+```{r figure3, fig.width=7, fig.height=3.6, fig.cap='Mean review scores across order-level freight-charge quartiles.'}
+freight_breaks <- quantile(analysis_data$freight_total, probs = c(0, 0.25, 0.5, 0.75, 1))
+freight_data <- analysis_data
+freight_data$freight_quartile <- cut(freight_data$freight_total, breaks = freight_breaks,
+  labels = c("Q1 (Lowest)", "Q2", "Q3", "Q4 (Highest)"), include.lowest = TRUE)
+freight_grouped <- group_by(freight_data, freight_quartile)
+freight_summary <- summarise(freight_grouped, n_orders = n(),
+                             mean_review = mean(review_score), .groups = "drop")
+ggplot(freight_summary, aes(x = freight_quartile, y = mean_review)) +
+  geom_col(fill = "steelblue", width = 0.65) +
+  geom_text(aes(label = round(mean_review, 2)), vjust = -0.5, size = 3.7) +
+  geom_text(aes(label = paste0("n=", n_orders)), y = 0.3, colour = "white", size = 3) +
+  scale_y_continuous(limits = c(0, 5), breaks = 0:5) +
+  labs(x = "Freight-charge quartile", y = "Average review score (1-5)") +
+  theme_minimal(base_size = 11)
+```
+
+Figure 3 divides freight charges into approximately equal-sized quartiles, with boundaries of BRL `r sprintf('%.2f', freight_breaks[2])`, `r sprintf('%.2f', freight_breaks[3])` and `r sprintf('%.2f', freight_breaks[4])`. Average ratings decline from `r sprintf('%.2f', freight_summary$mean_review[1])` in the lowest quartile to `r sprintf('%.2f', freight_summary$mean_review[4])` in the highest. Higher shipping charges are associated with lower ratings, supporting the inclusion of freight in Model 2.
+
+```{r figure4, fig.width=7, fig.height=4.3, fig.cap='Mean review scores for the ten largest known single-category groups.'}
+category_data <- filter(analysis_data,
+  !product_category %in% c("Unknown", "Mixed", "Mixed / unknown"))
+category_grouped <- group_by(category_data, product_category)
+category_summary <- summarise(category_grouped, n_orders = n(),
+                              mean_review = mean(review_score), .groups = "drop")
+category_summary <- arrange(category_summary, desc(n_orders), product_category)
+category_summary <- head(category_summary, 10)
+category_summary$category_label <- paste0(
+  tools::toTitleCase(gsub("_", " ", category_summary$product_category)),
+  " (n=", category_summary$n_orders, ")")
+ggplot(category_summary, aes(x = reorder(category_label, mean_review), y = mean_review)) +
+  geom_col(fill = "steelblue", width = 0.7) +
+  geom_text(aes(label = sprintf("%.2f", mean_review)), hjust = -0.3, size = 3.4) +
+  coord_flip() +
+  scale_y_continuous(limits = c(0, 5), breaks = 0:5) +
+  labs(x = NULL, y = "Average review score (1-5)") +
+  theme_minimal(base_size = 10)
+```
+
+Figure 4 compares the ten largest known single-category groups, ranked by average review score. Ratings range from `r sprintf('%.2f', min(category_summary$mean_review))` to `r sprintf('%.2f', max(category_summary$mean_review))`. The category spread is modest, and every displayed category averages above four points. Category controls allow Model 2 to account for these differences.
+
+# 5. Models and Comparison
+
+Both models use the same `r format(nrow(model_data), big.mark=',')` category-complete orders. A fixed random seed assigns 80% to training: `r format(nrow(train), big.mark=',')` orders, with `r format(nrow(test), big.mark=',')` reserved for testing. Model 1 establishes the baseline relationship between lateness and review scores:
+
+```{r formula1, eval=FALSE, echo=TRUE}
+review_score ~ late_days
+```
+
+The lateness coefficient is `r sprintf('%.4f', b1)`, with a 95% confidence interval of `r sprintf('[%.4f, %.4f]', ci1[1], ci1[2])`. Each additional late day is associated with approximately `r sprintf('%.3f', abs(b1))` fewer review points. The interval lies entirely below zero, supporting a negative relationship.
+
+Model 2 adds freight, item value and product category to estimate the lateness relationship while accounting for differences in order characteristics:
+
+```{r formula2, eval=FALSE, echo=TRUE}
+review_score ~ late_days + freight_total + order_value + product_category
+```
+
+The adjusted lateness coefficient is `r sprintf('%.4f', b2)`, with a 95% confidence interval of `r sprintf('[%.4f, %.4f]', ci2[1], ci2[2])`. Holding the included characteristics constant, each additional late day corresponds to approximately `r sprintf('%.3f', abs(b2))` fewer points. Adjustment leaves the negative relationship almost unchanged. Category comparisons use bed/bath/table as the reference, with Mixed orders represented separately.
+
+```{r comparison-table, results='asis'}
+kable(model_comparison, col.names = c("Measure", "Model 1", "Model 2"),
+      booktabs = TRUE, format = "latex",
+      caption = "Models fitted to the same training orders")
+```
+
+The models are directly comparable because they use identical training observations, outcomes and measurement scales. Adjusted R-squared increases from `r sprintf('%.4f', adj1)` to `r sprintf('%.4f', adj2)`. Model 2 provides the better training fit after accounting for its additional predictors and is the preferred model for explaining the adjusted relationship.
+
+# 6. Discussion
+
+The findings consistently connect late delivery with poorer customer evaluations. Delivery reliability is therefore a clear priority for further operational investigation. Several issues qualify interpretation. The observational design does not establish that delays cause lower ratings. Product quality, seller service, delivery distance and customer expectations may influence both logistics and reviews; freight differences may also reflect these factors. Review scores are ordinal and bounded, while linear regression assumes a constant average change per late day. The grouped pattern suggests that nonlinear specifications deserve further study. Conventional confidence intervals depend on model assumptions, and orders sharing customers or sellers may have correlated errors. Some ratings may precede delivery. The sample covers completed deliveries, excluding cancelled and undelivered orders, and the model further excludes unknown categories. Finally, Model 2 explains about nine percent of training-sample variation. Its higher adjusted R-squared establishes better explanatory fit within that sample. The reserved test set has not been evaluated, so predictive superiority remains an open question. Future analysis should examine review timing, nonlinear delay patterns and test-set performance.
+
+# 7. Conclusion
+
+Delivery delays are strongly associated with lower review scores. Ratings fall across delay groups, and late orders receive predominantly one-star reviews. The negative lateness coefficient persists after accounting for freight, item value and product category. Model 2 offers the better adjusted explanatory fit. Together, the visualisations and models identify delivery timeliness as a central feature of customer satisfaction in the Olist data.
+
+Source: Olist, *Brazilian E-Commerce Public Dataset*, [Kaggle](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce).
